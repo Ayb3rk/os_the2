@@ -7,12 +7,14 @@ extern "C" {
 #include <iostream>
 #include <pthread.h>
 #include <sys/time.h>
+#include <semaphore.h>
 #include <vector>
+#include <tuple>
 using namespace std;
 
 int **matrix;
 int **smoker_count;
-pthread_mutex_t **mutexes;
+sem_t **semaphores;
 vector<pair<int, string>> commands;
 pthread_mutex_t cond_mutex_stop_smoking;
 pthread_cond_t cond_stop_smoking;
@@ -31,7 +33,7 @@ pthread_cond_t start_cond;
 bool is_break = false;
 bool is_stop = false;
 int priv_num;
-int smoker_num;
+int smoker_num = -1;
 int waiting = 0;
 int stopped = 0;
 
@@ -73,7 +75,7 @@ void waitForContinue(privates *priv){
     pthread_cond_wait(&cond_var_continuestop, &cond_mutex_continuestop);
     pthread_mutex_unlock(&cond_mutex_continuestop);
     if(is_stop){ //stop is given when private is in break
-        hw2_notify(PROPER_PRIVATE_EXITED, priv->gid, 0, 0);
+        hw2_notify(PROPER_PRIVATE_STOPPED, priv->gid, 0, 0);
         pthread_mutex_lock(&stop_mutex);
         priv_num--;
         stopped++;
@@ -95,7 +97,7 @@ void waitForWakeUpCleaner(privates *priv){ //privates wait here to be woken up
         waitForContinue(priv);
     }
     else if(is_stop){ //stop is given while waiting for the area, exit
-        hw2_notify(PROPER_PRIVATE_EXITED, priv->gid, 0, 0);
+        hw2_notify(PROPER_PRIVATE_STOPPED, priv->gid, 0, 0);
         pthread_mutex_lock(&stop_mutex);
         stopped++;
         priv_num--;
@@ -138,18 +140,20 @@ void *command_func(void *arg) {
         if(command == "break"){
             hw2_notify(ORDER_BREAK, 0, 0, 0);
             is_break = true;
-            while(waiting != priv_num){
+            while(waiting < priv_num){
                 pthread_cond_broadcast(&cond_var_breakstop);
                 pthread_cond_broadcast(&wake_up_cond);
             }
         }
         else if(command == "stop"){
+            int temp_num = priv_num + smoker_num;
             hw2_notify(ORDER_STOP, 0, 0, 0);
             is_break = false;
             is_stop = true;
-            while(stopped != priv_num + smoker_num){
+            while(stopped < temp_num){
                 pthread_cond_broadcast(&cond_var_continuestop);
                 pthread_cond_broadcast(&cond_var_breakstop);
+                pthread_cond_broadcast(&cond_stop_smoking);
                 pthread_cond_broadcast(&wake_up_cond);
             }
         }
@@ -181,14 +185,14 @@ void *clean(void *arg){
         //try to lock the area
         for(int j = start_x; j < end_x; j++){
             for(int k = start_y; k < end_y; k++){
-                if(pthread_mutex_trylock(&mutexes[j][k]) != 0){ //check if the cell is available
-                    for(int l = start_x; l <= j; l++){ //it is not available, unlock the locked cells
-                        for(int m = start_y; m <= k; m++){
+                if(sem_trywait(&semaphores[j][k]) != 0){ //check if the cell is available
+                    for(int l = start_x; l < end_x; l++){ //it is not available, unlock the locked cells
+                        for(int m = start_y; m <= end_y; m++){
                             if(l == j && m == k){
                                 waitForWakeUpCleaner(priv); //sleep until someone finishes smoking or cleaning
                                 goto clean; //start cleaning again
                             }
-                            pthread_mutex_unlock(&mutexes[l][m]);
+                            sem_post(&semaphores[l][m]);
                         }
                     }
                 }
@@ -208,7 +212,7 @@ void *clean(void *arg){
                         //unlock the locked area, since a command is given
                         for(int a = start_x; a < end_x; a++){
                             for(int b = start_y; b < end_y; b++){
-                                pthread_mutex_unlock(&mutexes[a][b]);
+                                sem_post(&semaphores[a][b]);
                             }
                         }
                         if(is_break){ //command is break
@@ -220,7 +224,7 @@ void *clean(void *arg){
                             stopped++;
                             priv_num--;
                             pthread_mutex_unlock(&stop_mutex);
-                            hw2_notify(PROPER_PRIVATE_EXITED, priv->gid, 0, 0);
+                            hw2_notify(PROPER_PRIVATE_STOPPED, priv->gid, 0, 0);
                             pthread_exit(nullptr);
                         }
                     }
@@ -233,7 +237,7 @@ void *clean(void *arg){
         //unlock the area
         for(int j = start_x; j < end_x; j++){
             for(int k = start_y; k < end_y; k++){
-                pthread_mutex_unlock(&mutexes[j][k]);
+                sem_post(&semaphores[j][k]);
             }
         }
 
@@ -244,7 +248,6 @@ void *clean(void *arg){
     }
     hw2_notify(PROPER_PRIVATE_EXITED, priv->gid, 0, 0);
     pthread_mutex_lock(&stop_mutex);
-    stopped++;
     priv_num--;
     pthread_mutex_unlock(&stop_mutex);
     return nullptr;
@@ -269,36 +272,51 @@ void *smoking(void *arg){
             int cigar_i = start_i;
             int cigar_j = start_j;
             //try to lock the cell first
-            if(pthread_mutex_trylock(&mutexes[smoke_i][smoke_j]) != 0){ //there shouldn't be smoker or cleaner in this cell
+            if(sem_trywait(&semaphores[smoke_i][smoke_j]) != 0){ //there shouldn't be smoker or cleaner in this cell
                 waitForWakeUpSmoker(smoker); //if there is, goto sleep
                 goto smoke;
             }
+            pthread_mutex_lock(&smoker_count_mutex);
+            smoker_count[smoke_i][smoke_j]++;
+            pthread_mutex_unlock(&smoker_count_mutex);
             //if cell is available, try to get the lock of the cells around it
             for(int i = start_i; i <= end_i; i++){
                 for(int j = start_j; j <= end_j; j++){
-                    if(smoker_count[i][j] > 0){ //if there is a smoker in this cell, no need to lock it
+                    if(smoker_count[i][j] > 0 || (i == smoke_i && j == smoke_j)){ //if there is a smoker in this cell, no need to lock it
+                        pthread_mutex_lock(&smoker_count_mutex);
+                        smoker_count[i][j]++;
+                        pthread_mutex_unlock(&smoker_count_mutex);
                         continue;
                     }
-                    if(pthread_mutex_trylock(&mutexes[i][j]) != 0){ //check if the cell is available
-                        for(int a = start_i; a <= i; a++){ //it is not available, unlock the locked cells
-                            for(int b = start_j; b <= j; b++){
-                                if(a == smoke_i && b == smoke_j){
-                                    continue;
-                                }
+                    if(sem_trywait(&semaphores[i][j]) != 0){ //check if the cell is available
+                        for(int a = start_i; a <= end_i; a++){ //it is not available, unlock the locked cells
+                            for(int b = start_j; b <= end_j; b++){
                                 if(a == i && b == j){
-                                    waitForWakeUpSmoker(smoker); //sleep until someone finishes smoking or cleaning
-                                    goto smoke; //start smoking again
+                                    waitForWakeUpSmoker(smoker);
+                                    goto smoke;
                                 }
-                                pthread_mutex_lock(&smoker_count_mutex);
-                                smoker_count[a][b]--;
-                                pthread_mutex_unlock(&smoker_count_mutex);
-                                pthread_mutex_unlock(&mutexes[a][b]);
+                                if(a == smoke_i && b == smoke_j){
+                                    pthread_mutex_lock(&smoker_count_mutex);
+                                    smoker_count[i][j]--;
+                                    pthread_mutex_unlock(&smoker_count_mutex);
+                                    sem_post(&semaphores[a][b]);
+                                }
+                                else{
+                                    if(smoker_count[a][b] == 1){
+                                        sem_post(&semaphores[a][b]);
+                                    }
+                                    pthread_mutex_lock(&smoker_count_mutex);
+                                    smoker_count[i][j]--;
+                                    pthread_mutex_unlock(&smoker_count_mutex);
+                                }
                             }
                         }
                     }
-                    pthread_mutex_lock(&smoker_count_mutex);
-                    smoker_count[i][j]++;
-                    pthread_mutex_unlock(&smoker_count_mutex);
+                    else{ //lock is successful
+                        pthread_mutex_lock(&smoker_count_mutex);
+                        smoker_count[i][j]++;
+                        pthread_mutex_unlock(&smoker_count_mutex);
+                    }
                 }
             }
             //notify that the area is locked
@@ -314,15 +332,14 @@ void *smoking(void *arg){
                     //unlock the locked area, since a command is given
                     for(int a = start_i; a < end_i; a++){
                         for(int b = start_j; b < end_j; b++){
-                            pthread_mutex_unlock(&mutexes[a][b]);
+                            sem_post(&semaphores[a][b]);
                         }
                     }
                     if(is_stop){ //command is stop
                         pthread_mutex_lock(&stop_mutex);
                         stopped++;
-                        smoker_num--;
                         pthread_mutex_unlock(&stop_mutex);
-                        hw2_notify(SNEAKY_SMOKER_EXITED, smoker->sid, 0, 0);
+                        hw2_notify(SNEAKY_SMOKER_STOPPED, smoker->sid, 0, 0);
                         pthread_exit(nullptr);
                     }
                 }
@@ -348,14 +365,15 @@ void *smoking(void *arg){
             //unlock the area
             for(int i = start_i; i <= end_i; i++){
                 for(int j = start_j; j <= end_j; j++){
-                    if(smoker_count[i][j] == 1){
-                        pthread_mutex_unlock(&mutexes[i][j]);
+                    if(smoker_count[i][j] == 1 && !(i == smoke_i && j == smoke_j)){
+                        sem_post(&semaphores[i][j]);
                     }
                     pthread_mutex_lock(&smoker_count_mutex);
                     smoker_count[i][j]--;
                     pthread_mutex_unlock(&smoker_count_mutex);
                 }
             }
+            sem_post(&semaphores[smoke_i][smoke_j]);
             //delete the point from vector
             smoke_points->erase(smoke_points->begin());
             hw2_notify(SNEAKY_SMOKER_LEFT, smoker->sid, smoke_i, smoke_j);
@@ -364,7 +382,6 @@ void *smoking(void *arg){
 
     hw2_notify(SNEAKY_SMOKER_EXITED, smoker->sid, 0, 0);
     pthread_mutex_lock(&smoker_count_mutex);
-    stopped++;
     smoker_num--;
     pthread_mutex_unlock(&smoker_count_mutex);
     return nullptr;
@@ -413,13 +430,13 @@ int main(){
     #pragma endregion
 
     #pragma region "creating mutexes and is_smoker flags for each cell"
-    mutexes = new pthread_mutex_t*[grid_x];
+    semaphores = new sem_t*[grid_x];
     smoker_count = new int*[grid_x];
     for(int i = 0; i < grid_x; i++) {
-        mutexes[i] = new pthread_mutex_t[grid_y];
+        semaphores[i] = new sem_t[grid_y];
         smoker_count[i] = new int[grid_y];
         for(int j = 0; j < grid_y; j++){
-            pthread_mutex_init(&mutexes[i][j], nullptr);
+            sem_init(&semaphores[i][j], 0, 1);
             smoker_count[i][j] = 0;
         }
     }
@@ -427,36 +444,47 @@ int main(){
     #pragma endregion
 
     #pragma region "taking commands"
-    int command_num;
+    int command_num = -1;
     cin >> command_num;
-    for(int i = 0; i < command_num; i++){
+    if(command_num != EOF){
+        for(int i = 0; i < command_num; i++){
         string command;
         int time;
         cin >> time;
         cin >> command;
         commands.emplace_back(time,command);
+        }
+    }
+    else{
+        command_num = 0;
     }
 
     #pragma endregion
 
     #pragma region "taking smoker info"
     cin >> smoker_num;
-    for(int i = 0; i < smoker_num; i++){
+    int smoker_wait = smoker_num;
+    if(smoker_num != EOF){
+        for(int i = 0; i < smoker_num; i++){
         struct sneaky_smoker temp{};
         cin >> temp.sid;
         cin >> temp.ts;
         cin >> temp.cc;
         temp.smoke_points = new vector<tuple<int, int, int>>();
-        for(int j = 0; j < temp.cc; j++){
-            int temp_i;
-            int temp_j;
-            int count;
-            cin >> temp_i;
-            cin >> temp_j;
-            cin >> count;
-            temp.smoke_points->emplace_back(temp_i,temp_j, count);
-        }
-        smoker.push_back(temp);
+            for(int j = 0; j < temp.cc; j++){
+                int temp_i;
+                int temp_j;
+                int count;
+                cin >> temp_i;
+                cin >> temp_j;
+                cin >> count;
+                temp.smoke_points->emplace_back(temp_i,temp_j, count);
+            }
+            smoker.push_back(temp);
+        }   
+    }
+    else{
+        smoker_num = 0;
     }
     #pragma endregion
 
@@ -479,15 +507,19 @@ int main(){
 
     #pragma region "creating threads for proper privates"
     auto *threads = new pthread_t[priv_num];
-    for(int i = 0; i < priv_num; i++){
+    int temp_priv = priv_num;
+    for(int i = 0; i < temp_priv; i++){
         pthread_create(&threads[i], nullptr, clean, (void*)&priv[i]);
     }
     #pragma endregion
 
     #pragma region "creating threads for sneaky smokers"
-    auto *smoker_threads = new pthread_t[smoker_num];
-    for(int i = 0; i < smoker_num; i++){
+    pthread_t *smoker_threads;
+    if(smoker_num > 0){
+        smoker_threads = new pthread_t[smoker_num];
+        for(int i = 0; i < smoker_num; i++){
         pthread_create(&smoker_threads[i], nullptr, smoking, (void*)&smoker[i]);
+        }
     }
     #pragma endregion
 
@@ -497,7 +529,7 @@ int main(){
     #pragma endregion
 
     #pragma region "waiting for smoker threads to finish"
-    for(int i = 0; i < smoker_num; i++){
+    for(int i = 0; i < smoker_wait; i++){
         pthread_join(smoker_threads[i], nullptr);
     }
     #pragma endregion
@@ -515,5 +547,4 @@ int main(){
 
     return 0;
 }
-
 
