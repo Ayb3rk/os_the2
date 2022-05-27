@@ -269,8 +269,9 @@ void *smoking(void *arg){
             int start_j = smoke_j - 1;
             int end_i = smoke_i + 1;
             int end_j = smoke_j + 1;
-            int cigar_i = start_i;
-            int cigar_j = start_j;
+            int cigar_i = 0;
+            int cigar_j = 0;
+            int caseNum = 0;
             //try to lock the cell first
             if(sem_trywait(&semaphores[smoke_i][smoke_j]) != 0){ //there shouldn't be smoker or cleaner in this cell
                 waitForWakeUpSmoker(smoker); //if there is, goto sleep
@@ -344,22 +345,42 @@ void *smoking(void *arg){
                     }
                 }
                 //else it is timed out, just continue
-                matrix[cigar_i][cigar_j]++;
-                hw2_notify(SNEAKY_SMOKER_FLICKED, smoker->sid, cigar_i, cigar_j);
-                if(cigar_j < end_j ){
-                    cigar_j++;
-                }
-                else{
-                    cigar_j = start_j;
-                    if(cigar_i < end_i){
-                        cigar_i++;
-                    }
-                    else{
-                        cigar_i = start_i;
-                    }
-                }
-                if(cigar_i == smoke_i && cigar_j == smoke_j){
-                    cigar_j++;
+                matrix[start_i+cigar_i][start_j+cigar_j]++;
+                hw2_notify(SNEAKY_SMOKER_FLICKED, smoker->sid, cigar_i+start_i, cigar_j+start_j);
+                caseNum++;
+                switch(caseNum%8){
+                    case 0:
+                        cigar_i = 0;
+                        cigar_j = 0;
+                        break;
+                    case 1:
+                        cigar_i = 0;
+                        cigar_j = 1;
+                        break;
+                    case 2:
+                        cigar_i = 0;
+                        cigar_j = 2;
+                        break;
+                    case 3:
+                        cigar_i = 1;
+                        cigar_j = 2;
+                        break;
+                    case 4:
+                        cigar_i = 2;
+                        cigar_j = 2;
+                        break;
+                    case 5:
+                        cigar_i = 2;
+                        cigar_j = 1;
+                        break;
+                    case 6:
+                        cigar_i = 2;
+                        cigar_j = 0;
+                        break;
+                    case 7:
+                        cigar_i = 1;
+                        cigar_j = 0;
+                        break;
                 }
             }
             //unlock the area
